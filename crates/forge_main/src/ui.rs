@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use colored::Colorize;
+use console::style;
 use convert_case::{Case, Casing};
 use forge_api::{
     API, AgentId, AnyProvider, ApiKeyRequest, AuthContextRequest, AuthContextResponse, ChatRequest,
@@ -1422,24 +1423,19 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
             }
         }
 
-        // Show failed MCP servers
-        if !all_tools.mcp.get_failures().is_empty() {
-            info = info.add_title("FAILED");
-            for (server_name, error) in all_tools.mcp.get_failures().iter() {
-                // Truncate error message for readability
-                let truncated_error = if error.len() > 80 {
-                    format!("{}...", &error[..77])
-                } else {
-                    error.clone()
-                };
-                info = info.add_value(format!("[✗] {server_name} - {truncated_error}"));
-            }
-        }
-
         if porcelain {
             self.writeln(Porcelain::from(&info).uppercase_headers().truncate(3, 60))?;
         } else {
             self.writeln(info)?;
+        }
+
+        // Show failed MCP servers
+        if !porcelain && !all_tools.mcp.get_failures().is_empty() {
+            self.writeln("MCP FAILURES\n".dimmed().bold())?;
+            for (_, error) in all_tools.mcp.get_failures().iter() {
+                let error = style(error).red();
+                self.writeln(error)?;
+            }
         }
 
         Ok(())
@@ -1458,7 +1454,6 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
             None => None,
         };
 
-        let key_info = self.api.get_login_info().await;
         // Fetch agent
         let agent = self.api.get_active_agent().await;
 
@@ -1506,11 +1501,6 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
             _ => {
                 // No provider available
             }
-        }
-
-        // Add user information if available
-        if let Some(login_info) = key_info? {
-            info = info.extend(Info::from(&login_info));
         }
 
         // Add conversation information if available
@@ -1874,7 +1864,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
                 self.on_custom_event(event.into()).await?;
             }
             SlashCommand::Model => {
-                self.on_model_selection().await?;
+                self.on_model_selection(None).await?;
             }
             SlashCommand::Provider => {
                 self.on_provider_selection().await?;
@@ -2024,11 +2014,18 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
     /// Shows columns: MODEL, PROVIDER, CONTEXT WINDOW, TOOL SUPPORTED, IMAGE
     /// with a non-selectable header row.
     ///
+    /// When `provider_filter` is `Some`, only models belonging to that provider
+    /// are shown. This is used during onboarding so that after a provider is
+    /// selected the model list is scoped to that provider only.
+    ///
     /// # Returns
     /// - `Ok(Some(ModelId))` if a model was selected
     /// - `Ok(None)` if selection was canceled
     #[async_recursion::async_recursion]
-    async fn select_model(&mut self) -> Result<Option<ModelId>> {
+    async fn select_model(
+        &mut self,
+        provider_filter: Option<ProviderId>,
+    ) -> Result<Option<ModelId>> {
         // Check if provider is set otherwise first ask to select a provider
         if self.api.get_default_provider().await.is_err() {
             self.on_provider_selection().await?;
@@ -2042,10 +2039,18 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         }
 
         // Fetch models from ALL configured providers (matches shell plugin's
-        // `forge list models --porcelain`)
+        // `forge list models --porcelain`), then optionally filter by provider.
         self.spinner.start(Some("Loading"))?;
         let mut all_provider_models = self.api.get_all_provider_models().await?;
         self.spinner.stop(None)?;
+
+        // When a provider filter is specified (e.g. during onboarding after a
+        // provider was just selected), restrict the list to that provider's
+        // models so the user cannot accidentally pick a model from a different
+        // provider.
+        if let Some(ref filter_id) = provider_filter {
+            all_provider_models.retain(|pm| &pm.provider_id == filter_id);
+        }
 
         if all_provider_models.is_empty() {
             return Ok(None);
@@ -2201,6 +2206,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
                 let param_value = input.prompt()?.context("Parameter input cancelled")?;
 
                 anyhow::ensure!(!param_value.trim().is_empty(), "{param} cannot be empty");
+
+                let param_value = param_value.trim_end_matches('/').to_string();
 
                 Ok((param.to_string(), param_value))
             })
@@ -2636,11 +2643,15 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         self.select_provider_from_list(providers, "Provider", current_provider_id)
     }
 
-    // Helper method to handle model selection and update the conversation
+    // Helper method to handle model selection and update the conversation.
+    // When `provider_filter` is `Some`, only models from that provider are shown.
     #[async_recursion::async_recursion]
-    async fn on_model_selection(&mut self) -> Result<Option<ModelId>> {
+    async fn on_model_selection(
+        &mut self,
+        provider_filter: Option<ProviderId>,
+    ) -> Result<Option<ModelId>> {
         // Select a model
-        let model_option = self.select_model().await?;
+        let model_option = self.select_model(provider_filter).await?;
 
         // If no model was selected (user canceled), return early
         let model = match model_option {
@@ -2742,13 +2753,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
             let model_available = models.iter().any(|m| m.id == current_model);
 
             if !model_available {
-                // Prompt user to select a new model
+                // Prompt user to select a new model, scoped to the activated provider
                 self.writeln_title(TitleFormat::info("Please select a new model"))?;
-                self.on_model_selection().await?;
+                self.on_model_selection(Some(provider.id.clone())).await?;
             }
         } else {
-            // No model set, select one now
-            self.on_model_selection().await?;
+            // No model set, select one now scoped to the activated provider
+            self.on_model_selection(Some(provider.id.clone())).await?;
         }
 
         Ok(())
@@ -2862,7 +2873,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn() -> A + Send + Sync> UI<A, F> {
         let mut operating_model = self.get_agent_model(active_agent.clone()).await;
         if operating_model.is_none() {
             // Use the model returned from selection instead of re-fetching
-            operating_model = self.on_model_selection().await?;
+            operating_model = self.on_model_selection(None).await?;
         }
 
         // Validate provider is configured before loading agents

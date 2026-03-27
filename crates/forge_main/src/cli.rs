@@ -54,30 +54,9 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub verbose: bool,
 
-    /// Enable restricted mode for enhanced security using the permissions
-    /// feature.
-    #[arg(long, default_value_t = false, short = 'r')]
-    pub restricted: bool,
-
     /// Agent ID to use for this session.
     #[arg(long, alias = "aid")]
     pub agent: Option<AgentId>,
-
-    /// Override the model to use for this session.
-    ///
-    /// When provided, uses this model instead of the configured default.
-    /// This is a runtime override and does not change the permanent
-    /// configuration.
-    #[arg(long)]
-    pub model: Option<ModelId>,
-
-    /// Override the provider to use for this session.
-    ///
-    /// When provided, uses this provider instead of the configured default.
-    /// This is a runtime override and does not change the permanent
-    /// configuration.
-    #[arg(long)]
-    pub provider: Option<ProviderId>,
 
     /// Top-level subcommands.
     #[command(subcommand)]

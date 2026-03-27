@@ -6,10 +6,14 @@ use anyhow::Result;
 use clap::Parser;
 use forge_api::ForgeAPI;
 use forge_domain::TitleFormat;
-use forge_main::{Cli, Sandbox, TitleDisplayExt, UI, tracker};
+use forge_main::{Cli, Sandbox, TitleDisplayExt, UI, rprompt_fast, tracker, utils};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Enable ANSI color support on Windows console
+    #[cfg(windows)]
+    let _ = enable_ansi_support::enable_ansi_support();
+
     // Install default rustls crypto provider (ring) before any TLS connections
     // This is required for rustls 0.23+ when multiple crypto providers are
     // available
@@ -31,6 +35,76 @@ async fn main() -> Result<()> {
     }));
 
     // Initialize and run the UI
+
+    // Fast path: zsh rprompt without conversation ID - check BEFORE Cli::parse()
+    let args: Vec<String> = std::env::args().collect();
+    let has_conv = std::env::var("_FORGE_CONVERSATION_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
+    if args.len() >= 3 && args[1] == "zsh" && args[2] == "rprompt" && !has_conv {
+        println!(" %B%F{{240}}󱙺 FORGE%f%b");
+        return Ok(());
+    }
+
+    // Fast path: zsh rprompt WITH conversation ID - direct SQLite query
+    if args.len() >= 3
+        && args[1] == "zsh"
+        && args[2] == "rprompt"
+        && has_conv
+        && let Ok(conv_id) = std::env::var("_FORGE_CONVERSATION_ID")
+    {
+        let conv_id = conv_id.trim();
+        if !conv_id.is_empty() {
+            // Try fast path - if it fails, fall through to normal path
+            if let Some(data) = rprompt_fast::fetch_rprompt_data(conv_id) {
+                let use_nerd_font = std::env::var("NERD_FONT")
+                    .or_else(|_| std::env::var("USE_NERD_FONT"))
+                    .map(|v| v == "1")
+                    .unwrap_or(true);
+
+                // Check if we have token count (active state) or just show inactive
+                if let Some(token_count) = data.token_count {
+                    let icon = if use_nerd_font { "󱙺" } else { "" };
+                    let count_str = utils::humanize_number(token_count);
+
+                    // Active state: bright colors
+                    print!(" %B%F{{15}}{} FORGE%f%b %B%F{{15}}{}%f%b", icon, count_str);
+
+                    if let Some(cost) = data.cost {
+                        let currency = std::env::var("FORGE_CURRENCY_SYMBOL")
+                            .unwrap_or_else(|_| "$".to_string());
+                        let ratio: f64 = std::env::var("FORGE_CURRENCY_CONVERSION_RATE")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1.0);
+                        print!(" %B%F{{2}}{}{:.2}%f%b", currency, cost * ratio);
+                    }
+
+                    if let Some(ref model) = data.model {
+                        let model_icon = if use_nerd_font { "󰑙" } else { "" };
+                        print!(" %F{{134}}{}{}", model_icon, model);
+                    }
+
+                    println!();
+                    return Ok(());
+                } else {
+                    // No token count - show inactive/dimmed state
+                    let icon = if use_nerd_font { "󱙺" } else { "" };
+                    let model_str = data.model.as_deref().unwrap_or("forge");
+                    let model_icon = if use_nerd_font { "󰑙" } else { "" };
+
+                    print!(
+                        " %B%F{{240}}{} FORGE%f%b %F{{240}}{}{}%f",
+                        icon, model_icon, model_str
+                    );
+                    println!();
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     let mut cli = Cli::parse();
 
     // Check if there's piped input
@@ -58,18 +132,7 @@ async fn main() -> Result<()> {
         (_, _) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
-    // Initialize the ForgeAPI with the restricted mode if specified
-    let restricted = cli.restricted;
-    let cli_model = cli.model.clone();
-    let cli_provider = cli.provider.clone();
-    let mut ui = UI::init(cli, move || {
-        ForgeAPI::init(
-            restricted,
-            cwd.clone(),
-            cli_model.clone(),
-            cli_provider.clone(),
-        )
-    })?;
+    let mut ui = UI::init(cli, move || ForgeAPI::init(cwd.clone()))?;
     ui.run().await;
 
     Ok(())
@@ -114,10 +177,9 @@ mod tests {
     #[test]
     fn test_cli_parsing_other_flags_work_with_piping() {
         // Test that other CLI flags still work when expecting stdin input
-        let cli_with_flags = Cli::parse_from(["forge", "--verbose", "--restricted"]);
+        let cli_with_flags = Cli::parse_from(["forge", "--verbose"]);
         assert_eq!(cli_with_flags.prompt, None);
         assert_eq!(cli_with_flags.verbose, true);
-        assert_eq!(cli_with_flags.restricted, true);
     }
 
     #[test]
